@@ -1,4 +1,4 @@
-# Physics-Informed Kriging — Day 1 MVP (Role A)
+# Physics-Informed Kriging 
 
 This repo gives you a *one-day* runnable baseline for **anisotropic Gaussian Process (GP)**
 with a flow-aligned prior (rotate into along- and cross-flow coordinates). It includes:
