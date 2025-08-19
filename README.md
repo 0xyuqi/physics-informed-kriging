@@ -30,8 +30,8 @@ Artifacts are saved into `figures/` and `data/`:
 
 ## Roadmap (for A)
 
-**Today (done here):** baseline anisotropic GP + metrics + visualizations.  
-**Next:** implement *PDE soft-constraints* by adding virtual residual observations for a steady
+**1 .** baseline anisotropic GP + metrics + visualizations.  
+**2 :** implement *PDE soft-constraints* by adding virtual residual observations for a steady
 advection-diffusion operator at collocation points (see `src/models/physics_stub.py`).
 
 ## Notes
@@ -41,7 +41,7 @@ advection-diffusion operator at collocation points (see `src/models/physics_stub
 - You can let the GP optimizer tune length-scales or fix/scan values via CLI.
 
 
-## Role A — Final Deliverable (How to reproduce)
+## How to reproduce
 
 ### Isotropic baseline
 ```bash
