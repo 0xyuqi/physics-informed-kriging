@@ -28,10 +28,10 @@ Artifacts are saved into `figures/` and `data/`:
 - `data/synth_points.csv` — training points (x, y, z)
 - `data/grid_pred.csv` — dense grid predictions and uncertainty
 
-## Roadmap (for A)
+## Roadmap 
 
 **1 .** baseline anisotropic GP + metrics + visualizations.  
-**2 :** implement *PDE soft-constraints* by adding virtual residual observations for a steady
+**2 .** implement *PDE soft-constraints* by adding virtual residual observations for a steady
 advection-diffusion operator at collocation points (see `src/models/physics_stub.py`).
 
 ## Notes
