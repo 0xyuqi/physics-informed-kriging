@@ -6,7 +6,7 @@ with a flow-aligned prior (rotate into along- and cross-flow coordinates). It in
 - Synthetic data generator (advection-shaped field) — `scripts/generate_synth.py`
 - Baseline anisotropic GP (ARD RBF) in flow-aligned coords — `scripts/run_baseline.py`
 - Metrics: RMSE / MAE / CRPS, LOOCV, grid prediction to heatmaps
-- Stubs for PDE soft-constraint (to extend on Day 2-3) — `src/models/physics_stub.py`
+- Stubs for PDE soft-constraint — `src/models/physics_stub.py`
 
 ## Quickstart
 
