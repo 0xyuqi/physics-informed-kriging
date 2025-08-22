@@ -1,115 +1,149 @@
+"""
+Physics-soft GP with barrier + multi-scale flow-aligned kernels + conformal + active sampling.
+Compatibility: uses the same input files as baseline:
+  - data/synth_points.csv  (x,y,z)
+  - data/grid_coords.csv   (i,j,x,y)
+  - data/flow_meta.json    {vx,vy,...}
+Optional barrier: data/barrier.geojson (same coordinate system as x,y).
+"""
 
-import argparse, json, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from __future__ import annotations
+import json, argparse
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
-from sklearn.model_selection import KFold
-from scipy.ndimage import convolve
 
+# project utils/models
 import sys
-from pathlib import Path as _P
-sys.path.append(str(_P(__file__).resolve().parents[1]))
-from src.utils.geo import rotate_to_flow
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from src.utils.geo import ensure_coastline, load_geojson_polygon  # kept for future real-coast cases
+from src.utils.metrics import rmse, crps_gaussian, dir_variogram
+from src.utils.physics import pde_residual_steady
+from src.models.phys_soft import build_phys_kernel, fit_baseline, grid_search_phys
+from src.models.conformal import calibrate, coverage
+from src.models.active_sampling import pick_next_points
 
-def finite_diffs_2d(field, dx, dy):
-    # Central diff for first derivatives, 5-point Laplacian for second derivatives
-    kx = np.array([[0,0,0],[ -0.5, 0, 0.5],[0,0,0]])
-    ky = np.array([[0,-0.5,0],[0,0,0],[0,0.5,0]])
-    kxx = np.array([[0,0,0],[1,-2,1],[0,0,0]])
-    kyy = np.array([[0,1,0],[0,-2,0],[0,1,0]])
-    ux = convolve(field, kx, mode='nearest')/dx
-    uy = convolve(field, ky, mode='nearest')/dy
-    uxx = convolve(field, kxx, mode='nearest')/(dx*dx)
-    uyy = convolve(field, kyy, mode='nearest')/(dy*dy)
-    return ux, uy, uxx, uyy
-
-def build_gp_aniso(lp, lc, alpha):
-    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=[lp, lc], length_scale_bounds=(1e-2, 1e3)) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 1e-1))
-    return GaussianProcessRegressor(kernel=kernel, alpha=alpha, normalize_y=True, optimizer=None, n_restarts_optimizer=0)
-
-def cv_rmse(gp, X, y):
-    kf = KFold(n_splits=len(X))
-    errs = []
-    for tr, te in kf.split(X):
-        gp_cv = GaussianProcessRegressor(kernel=gp.kernel, alpha=gp.alpha, normalize_y=True, optimizer=None)
-        gp_cv.fit(X[tr], y[tr])
-        mu = gp_cv.predict(X[te])
-        errs.append((mu - y[te])**2)
-    return float(np.sqrt(np.mean(np.concatenate(errs))))
+# default knobs
+CFG = {
+    "alpha_obs": 1e-6,
+    "physics_lambda": 0.2,
+    "kappa": 0.25,
+    "angle_deg0": 30.0,
+    "barrier_lambda": 2.5,
+    "next_k": 20,
+    "min_dist": 6.0,
+    "port_xy": [20.0, 20.0],
+    "lam_cost": 0.3
+}
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--data_dir', type=str, default='data')
-    ap.add_argument('--out_dir', type=str, default='figures')
-    ap.add_argument('--length_parallel_list', type=float, nargs='+', default=[20,30,40])
-    ap.add_argument('--length_cross_list', type=float, nargs='+', default=[6,8,12])
-    ap.add_argument('--alpha', type=float, default=1e-6)
-    ap.add_argument('--lambda_phys', type=float, default=1.0)
-    ap.add_argument('--kappa', type=float, default=1.0)
+    ap = argparse.ArgumentParser(description="Physics-soft GP (2D, steady)")
+    ap.add_argument("--data_dir", type=str, default="data")
+    ap.add_argument("--out_dir", type=str, default="figures")
+    ap.add_argument("--use_barrier", action="store_true", help="use data/barrier.geojson if exists")
     args = ap.parse_args()
 
-    data_dir = Path(args.data_dir); out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    pts = pd.read_csv(data_dir/'synth_points.csv')
-    meta = json.loads((data_dir/'flow_meta.json').read_text())
-    grid = pd.read_csv(data_dir/'grid_coords.csv')
-    vx, vy = meta['vx'], meta['vy']
+    data_dir = Path(args.data_dir); out_dir = Path(args.out_dir)
+    pts_path  = data_dir/"synth_points.csv"
+    grid_path = data_dir/"grid_coords.csv"
+    meta_path = data_dir/"flow_meta.json"
+    if not (pts_path.exists() and grid_path.exists() and meta_path.exists()):
+        raise SystemExit("[ERR] missing data/*.csv or flow_meta.json; run scripts/generate_synth.py first.")
 
-    X_obs = pts[['x','y']].to_numpy()
-    y_obs = pts['z'].to_numpy()
+    pts  = pd.read_csv(pts_path)
+    grid = pd.read_csv(grid_path)
+    meta = json.loads(meta_path.read_text())
+    vx = float(meta.get("vx", 1.0)); vy = float(meta.get("vy", 0.3))
 
-    # Grid geometry
-    xs = np.sort(grid['x'].unique()); ys = np.sort(grid['y'].unique())
-    nx, ny = len(xs), len(ys)
-    dx = xs[1]-xs[0]; dy = ys[1]-ys[0]
-    Xg = grid[['x','y']].to_numpy()
+    X = pts[["x","y"]].to_numpy()
+    y = pts["z"].to_numpy()
 
-    # Rotate coordinates once for aniso GP
-    Xp_obs = rotate_to_flow(X_obs, vx, vy)
-    Xp_grid = rotate_to_flow(Xg, vx, vy)
+    # barrier polygon (optional)
+    coast_poly = None
+    if args.use_barrier and (data_dir/"barrier.geojson").exists():
+        coast_poly = load_geojson_polygon(str(data_dir/"barrier.geojson"))
 
-    rows = []
-    best = None
+    # baseline for comparison
+    base = fit_baseline(X, y, alpha=CFG["alpha_obs"])
 
-    for lp in args.length_parallel_list:
-        for lc in args.length_cross_list:
-            gp = build_gp_aniso(lp, lc, args.alpha)
-            # CV on rotated obs
-            rmse = cv_rmse(gp, Xp_obs, y_obs)
-            # Fit on all obs to get grid mean
-            gp.fit(Xp_obs, y_obs)
-            mu = gp.predict(Xp_grid).reshape(ny, nx)
+    # evaluation grid (for residual + plotting)
+    nx = int(grid["i"].max() + 1); ny = int(grid["j"].max() + 1)
+    xs = grid.drop_duplicates("i").sort_values("i")["x"].to_numpy()
+    ys = grid.drop_duplicates("j").sort_values("j")["y"].to_numpy()
 
-            ux, uy, uxx, uyy = finite_diffs_2d(mu, dx, dy)
-            resid = vx*ux + vy*uy - args.kappa*(uxx+uyy)
-            phys_pen = float(np.sqrt(np.mean(resid**2)))  # RMS residual
-            score = rmse + args.lambda_phys * phys_pen
+    # physics-soft model selection
+    X_eval = grid[["x","y"]].to_numpy()
+    best = grid_search_phys(X, y, X_eval, (nx,ny,xs,ys), (vx,vy), CFG["kappa"],
+                            coast_poly=coast_poly, alpha_obs=CFG["alpha_obs"],
+                            lam_phys=CFG["physics_lambda"], angle_deg0=CFG["angle_deg0"])
+    gp = best["gp"]
 
-            rows.append({'length_parallel':lp, 'length_cross':lc, 'RMSE':rmse, 'phys_pen':phys_pen, 'score':score})
-            if (best is None) or (score < best['score']):
-                best = {'lp':lp, 'lc':lc, 'rmse':rmse, 'phys_pen':phys_pen, 'score':score, 'mu':mu}
+    # predictions on points (for metrics vs baseline)
+    mu,std = gp.predict(X, return_std=True)
+    mu_b,std_b = base.predict(X, return_std=True)
+    metrics = {
+        "rmse_phys": rmse(y, mu),
+        "rmse_base": rmse(y, mu_b),
+        "crps_phys": crps_gaussian(y, mu, std),
+        "crps_base": crps_gaussian(y, mu_b, std_b),
+        "skill_vs_base": None
+    }
+    metrics["skill_vs_base"] = 1.0 - metrics["crps_phys"]/(metrics["crps_base"] + 1e-9)
+    metrics["best_cfg"] = {k: float(v) for k,v in best.items() if k in ("angle_rad","la_s","lc_s","la_l","lc_l")}
 
-    df = pd.DataFrame(rows)
-    df.to_csv(out_dir/'physics_soft_gridsearch.csv', index=False)
+    # grid maps (mean/std)
+    mu_g, std_g = gp.predict(X_eval, return_std=True)
+    Zm = mu_g.reshape(ny, nx); Zs = std_g.reshape(ny, nx)
 
-    # Save best mean map and residual map
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # mean
+    tri = mtri.Triangulation(grid["x"].to_numpy(), grid["y"].to_numpy())
+    plt.figure(); plt.tricontourf(tri, mu_g, levels=20); plt.colorbar(); plt.title("Mean (physics-soft)")
+    plt.scatter(pts["x"], pts["y"], s=8, c="k", alpha=0.6, linewidths=0.2)
+    plt.tight_layout(); plt.savefig(out_dir/"mean_physics_soft.png", dpi=160); plt.close()
+    # std
+    plt.figure(); plt.tricontourf(tri, std_g, levels=20); plt.colorbar(); plt.title("Std (physics-soft)")
+    plt.scatter(pts["x"], pts["y"], s=8, c="k", alpha=0.6, linewidths=0.2)
+    plt.tight_layout(); plt.savefig(out_dir/"std_map.png", dpi=160); plt.close()
+
+    # physics residual (steady)
+    R = pde_residual_steady(Zm, xs, ys, vx=vx, vy=vy, kappa=CFG["kappa"])
+    plt.figure(); plt.hist(R.ravel(), bins=60); plt.title("PDE residual (steady)")
+    plt.tight_layout(); plt.savefig(out_dir/"physics_residual.png", dpi=160); plt.close()
+
+    # directional variogram at grid nodes (use mean)
+    h1,g1 = dir_variogram(grid["x"].to_numpy(), grid["y"].to_numpy(), mu_g, angle_rad=np.arctan2(vy,vx))
+    h2,g2 = dir_variogram(grid["x"].to_numpy(), grid["y"].to_numpy(), mu_g, angle_rad=np.arctan2(vy,vx)+np.pi/2)
     plt.figure()
-    plt.imshow(best['mu'], origin='lower', extent=[xs.min(), xs.max(), ys.min(), ys.max()])
-    plt.scatter(pts['x'], pts['y'], s=10, alpha=0.7); plt.title(f'Physics-Soft Mean (lp={best["lp"]}, lc={best["lc"]})')
-    plt.colorbar(); plt.tight_layout()
-    plt.savefig(out_dir/'mean_physics_soft.png', dpi=150); plt.close()
+    if h1.size>0: plt.plot(h1,g1,label="‖ flow")
+    if h2.size>0: plt.plot(h2,g2,label="⊥ flow")
+    plt.legend(); plt.xlabel("lag"); plt.ylabel("γ(h)"); plt.title("Directional variogram")
+    plt.tight_layout(); plt.savefig(out_dir/"variogram.png", dpi=160); plt.close()
 
-    ux, uy, uxx, uyy = finite_diffs_2d(best['mu'], dx, dy)
-    resid = vx*ux + vy*uy - args.kappa*(uxx+uyy)
-    plt.figure()
-    plt.imshow(np.abs(resid), origin='lower', extent=[xs.min(), xs.max(), ys.min(), ys.max()])
-    plt.title('Physics Residual |L[u]| (RMS={:.3f})'.format(best['phys_pen']))
-    plt.colorbar(); plt.tight_layout()
-    plt.savefig(out_dir/'physics_residual.png', dpi=150); plt.close()
+    # conformal calibration (split calibration set from obs)
+    rng = np.random.default_rng(0)
+    cal_idx = rng.choice(len(X), size=max(1,int(0.3*len(X))), replace=False)
+    mu_c, std_c = gp.predict(X[cal_idx], return_std=True)
+    qhat = calibrate(y[cal_idx], mu_c, std_c, alpha=0.1)
+    cov = coverage(y, mu, std, qhat)
+    metrics["conformal_qhat"] = float(qhat); metrics["coverage_approx"] = float(cov)
 
-    # Save summary metrics
-    summary = {'best_length_parallel': best['lp'], 'best_length_cross': best['lc'], 'RMSE': best['rmse'], 'phys_pen': best['phys_pen'], 'score': best['score']}
-    (out_dir/'metrics_physics_soft.json').write_text(json.dumps(summary, indent=2))
-    print(json.dumps(summary, indent=2))
+    # cost-aware active sampling at grid nodes
+    tau = float(np.quantile(y, 0.85))
+    cands = grid[["x","y"]].to_numpy()
+    next_pts = pick_next_points(cands, mu_g, std_g, tau,
+                                k_pick=CFG["next_k"], min_dist=CFG["min_dist"],
+                                port=tuple(CFG["port_xy"]), lam_cost=CFG["lam_cost"])
+    np.savetxt(out_dir/"next_points.csv", next_pts, delimiter=",", header="x,y", comments="")
 
-if __name__ == '__main__':
+    # save metrics
+    (out_dir/"metrics_physics_soft.json").write_text(json.dumps(metrics, indent=2))
+    print("[OK] saved mean/std/metrics_physics_soft.json/physics_residual.png/variogram.png/next_points.csv")
+
+if __name__ == "__main__":
     main()
