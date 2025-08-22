@@ -1,67 +1,110 @@
-import argparse, json
-import numpy as np, pandas as pd
-from pathlib import Path
+"""
+Generate a competition-ready synthetic plume dataset
+Output: data/synth_points.csv, data/grid_coords.csv, data/flow_meta.json
+"""
 
-def make_field(xx, yy, vx, vy, seed=0):
-    rng = np.random.default_rng(seed)
-    # Flow-aligned coordinates (approx): project onto flow unit vectors
-    v = np.array([vx, vy]); v = v / (np.linalg.norm(v) + 1e-12)
-    ex, ey = v, np.array([-v[1], v[0]])
-    # Sources elongated along-flow
-    s1 = np.array([30.0, 40.0]); Lpar1, Lperp1 = 35.0, 10.0
-    s2 = np.array([65.0, 55.0]); Lpar2, Lperp2 = 25.0, 8.0
-    def gauss_elong(xy, s, Lp, Lt, amp):
-        d = xy - s
-        s_coord = d @ ex; t_coord = d @ ey
-        return amp * np.exp(-(s_coord/Lp)**2 - (t_coord/Lt)**2)
-    XY = np.stack([xx, yy], axis=-1)
-    z = gauss_elong(XY, s1, Lpar1, Lperp1, 1.0) + 0.6*gauss_elong(XY, s2, Lpar2, Lperp2, 1.0)
-    # Add gentle downstream trend
-    scoord = (XY @ ex).astype(float)
-    z += 0.002 * scoord
-    return z
+import argparse, json
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# Construct orthogonal basis, decompose main flow transport
+def flow_basis(vx: float, vy: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    ex: unit vector along flow (downstream)
+    ey: unit vector cross to flow (lateral)
+    """
+    v = np.array([vx, vy], dtype=float)
+    n = np.linalg.norm(v) + 1e-12
+    ex = v / n
+    ey = np.array([-ex[1], ex[0]], dtype=float)  # 90° CCW rotation of ex
+    return ex, ey
+
+
+# Gaussian plume
+"""
+1. Gaussian shape:
+In fluid, the concentration field of pollutants evolves over time,
+mainly controlled by advection (transport by water flow) + dispersion (random disturbance).
+Corresponds to the advection-diffusion equation, whose analytical solution is a Gaussian function.
+
+2. Elliptical Gaussian: advection + anisotropic dispersion
+"""
+def gauss_elong(xy: np.ndarray, center: np.ndarray,
+                ex: np.ndarray, ey: np.ndarray,
+                L_par: float, L_perp: float, amp: float = 1.0):
+    d = xy - center
+    s = d @ ex
+    t = d @ ey                             # Transform original coordinates into flow-aligned (s) and cross-flow (t)
+    return amp * np.exp(-(s/L_par)**2 - (t/L_perp)**2)
+
 
 def main(args):
-    out_data = Path(args.out_dir); out_data.mkdir(parents=True, exist_ok=True)
-    # Domain/grid
-    L = args.grid
-    xs = np.linspace(0, 100, L)
-    ys = np.linspace(0, 100, L)
-    xx, yy = np.meshgrid(xs, ys, indexing='xy')
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    vx, vy = args.vx, args.vy
-    z = make_field(xx, yy, vx, vy, seed=args.seed)
+    # grid
+    L = int(args.grid)
+    xs = np.linspace(0.0, 100.0, L)
+    ys = np.linspace(0.0, 100.0, L)
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    XY = np.stack([xx, yy], axis=-1)
 
-    # Sample observation points
+    ex, ey = flow_basis(args.vx, args.vy)   # Construct orthogonal basis vectors according to velocity components
+
+    # Two elongated elliptical Gaussian plumes in the flow direction,
+    # one strong & large, one weaker & smaller, more realistic
+    s1, Lp1, Lt1, a1 = np.array([30.0, 40.0]), 35.0, 10.0, 1.0
+    s2, Lp2, Lt2, a2 = np.array([65.0, 55.0]), 25.0, 8.0, 0.6
+
+    z = gauss_elong(XY, s1, ex, ey, Lp1, Lt1, a1) + gauss_elong(XY, s2, ex, ey, Lp2, Lt2, a2)
+    s_coord = (XY @ ex).astype(float)       # Flow-aligned coordinate s for each grid point
+    z = z + 0.002 * s_coord                 # Add a linear background along flow
+
+    # sample observations with noise
     rng = np.random.default_rng(args.seed)
-    idx = rng.choice(L*L, size=args.n_obs, replace=False)
-    xi = idx % L; yi = idx // L
-    x_obs = xs[xi]; y_obs = ys[yi]
-    z_obs = z[yi, xi] + rng.normal(0.0, args.noise, size=args.n_obs)
+    idx = rng.choice(L * L, size=int(args.n_obs), replace=False)
+    ix = idx % L
+    iy = idx // L
+    x_obs = xs[ix]
+    y_obs = ys[iy]
+    z_obs = z[iy, ix] + rng.normal(0.0, float(args.noise), size=int(args.n_obs))
 
-    # Save training points
-    pts = pd.DataFrame({'x': x_obs, 'y': y_obs, 'z': z_obs})
-    pts.to_csv(out_data / 'synth_points.csv', index=False)
+    # --- Output files ---
+    # 1. Observation points CSV
+    df_pts = pd.DataFrame({"x": x_obs, "y": y_obs, "z": z_obs})
+    (out_dir/"synth_points.csv").write_text(df_pts.to_csv(index=False))
 
-    # Save grid coords
-    gi, gj = np.meshgrid(np.arange(L), np.arange(L), indexing='xy')
-    grid = pd.DataFrame({'i': gi.ravel(), 'j': gj.ravel(), 'x': xx.ravel(), 'y': yy.ravel()})
-    grid.to_csv(out_data / 'grid_coords.csv', index=False)
+    # 2. Grid coordinates CSV
+    gi, gj = np.meshgrid(np.arange(L), np.arange(L), indexing="xy")
+    df_grid = pd.DataFrame({
+        "i": gi.ravel(), "j": gj.ravel(),
+        "x": xx.ravel(), "y": yy.ravel()
+    })
+    (out_dir / "grid_coords.csv").write_text(df_grid.to_csv(index=False))
 
-    # Metadata
-    meta = {'vx': vx, 'vy': vy, 'grid': L, 'noise': args.noise, 'seed': args.seed}
-    (out_data / 'flow_meta.json').write_text(json.dumps(meta, indent=2))
+    # 3. Metadata JSON (flow direction, grid, noise, random seed)
+    meta = {"vx": float(args.vx), "vy": float(args.vy),
+            "grid": int(L), "noise": float(args.noise), "seed": int(args.seed)}
+    (out_dir/"flow_meta.json").write_text(json.dumps(meta, indent=2))
 
-    print(f"Saved {len(pts)} obs to {out_data/'synth_points.csv'} with flow (vx, vy)=({vx}, {vy}) and grid {L}x{L}")
+    print(f"[OK] Saved {args.n_obs} obs to {out_dir/'synth_points.csv'}")
+    print(f"[OK] Grid {L}x{L} at {out_dir/'grid_coords.csv'}")
+    print(f"[OK] Flow (vx, vy)=({args.vx}, {args.vy}), noise={args.noise}, seed={args.seed}")
 
-if __name__ == '__main__':
-    p = argparse.ArgumentParser()
-    p.add_argument('--n_obs', type=int, default=40)
-    p.add_argument('--grid', type=int, default=100)
-    p.add_argument('--noise', type=float, default=0.1)
-    p.add_argument('--vx', type=float, default=1.0)
-    p.add_argument('--vy', type=float, default=0.3)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--out_dir', type=str, default='data')
-    args = p.parse_args()
+
+# Command line arguments
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n_obs", type=int, default=40)
+    ap.add_argument("--grid", type=int, default=80)
+    ap.add_argument("--noise", type=float, default=0.1)
+    ap.add_argument("--vx", type=float, default=1.0)
+    ap.add_argument("--vy", type=float, default=0.3)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--out_dir", type=str, default="data")
+    args = ap.parse_args()
     main(args)
