@@ -1,70 +1,90 @@
-# Physics-Informed Kriging 
+# Physics-Informed Kriging (Coastal, Malaysia shoreline)
 
-This repo gives you a  runnable baseline for **anisotropic Gaussian Process (GP)**
-with a flow-aligned prior (rotate into along- and cross-flow coordinates). It includes:
+This repo provides a runnable baseline for **anisotropic Gaussian Process (GP)** with a flow-aligned prior (rotate into along- and cross-flow coordinates), plus a **physics-soft** variant that respects **real Malaysia shoreline**.
 
+It includes:
 - Synthetic data generator (advection-shaped field) — `scripts/generate_synth.py`
-- Baseline anisotropic GP (ARD RBF) in flow-aligned coords — `scripts/run_baseline.py`
-- Metrics: RMSE / MAE / CRPS, LOOCV, grid prediction to heatmaps
-- Stubs for PDE soft-constraint — `src/models/physics_stub.py`
+- Baseline anisotropic GP (ARD RBF) in flow-aligned coords, optional along-flow trend, fast LOO — `scripts/run_baseline.py`
+- Physics-soft GP with **Malaysia shoreline barrier** (cross-land + near-shore penalties), **multi-scale kernel mix (RBF + RQ + Matérn-3/2)**, heteroscedastic noise, conformal intervals, and active sampling — `scripts/run_physics_soft.py`
+- Metrics: MAE / RMSE / CRPS, conformal coverage, directional variogram
+- Artifacts: heatmaps, PDE-residual histogram, next-round sampling CSV
 
 ## Quickstart
-
 ```bash
-# 1) (Optional) create venv and install deps
-# python -m venv .venv && source .venv/bin/activate
-# pip install -r requirements.txt
+# 0) Install deps
+pip install -r requirements.txt
 
-# 2) Generate synthetic data
-python scripts/generate_synth.py --n_obs 40 --grid 100 --noise 0.1 --seed 42
+# 1) Generate synthetic data (flow vector, grid, noise are configurable)
+python scripts/generate_synth.py --n_obs 40 --grid 80 --noise 0.1 --vx 1.0 --vy 0.3 --seed 7
 
-# 3) Run baseline anisotropic GP (flow-aligned)
-python scripts/run_baseline.py --length_parallel 30.0 --length_cross 8.0 --alpha 1e-6 --seed 42
-```
+# 2) Run baseline (anisotropic GP in flow-aligned coords, with fast LOO + along-flow trend)
+python scripts/run_baseline.py --fast_loo --use_trend
+# optional: tune kernel scales
+# python scripts/run_baseline.py --fast_loo --use_trend --length_parallel 30 --length_cross 8 --alpha 1e-6
 
-Artifacts are saved into `figures/` and `data/`:
-- `figures/mean_map.png` — posterior mean
-- `figures/std_map.png` — posterior std (uncertainty)
-- `data/synth_points.csv` — training points (x, y, z)
-- `data/grid_pred.csv` — dense grid predictions and uncertainty
+# 3) Run physics-soft (Malaysia shoreline automatically fit to grid; or pass your own)
+python scripts/run_physics_soft.py --use_trend
+# optional: reuse a local shoreline file to avoid network
+# python scripts/run_physics_soft.py --use_trend --coast_path data/malaysia_barrier.geojson
+````
 
-## Roadmap 
+## Artifacts
 
-**1 .** baseline anisotropic GP + metrics + visualizations.  
-**2 .** implement *PDE soft-constraints* by adding virtual residual observations for a steady
-advection-diffusion operator at collocation points (see `src/models/physics_stub.py`).
+* `figures/mean_physics_soft.png` — posterior mean (physics-soft, Malaysia barrier)
+* `figures/std_map.png` — posterior std (uncertainty)
+* `figures/physics_residual.png` — PDE residual histogram
+* `figures/variogram.png` — directional variogram (‖ / ⟂ to flow)
+* `figures/metrics_physics_soft.json` — key metrics + best hyperparameters
+* `figures/next_points.csv` — next-round sampling points (x, y)
+* `figures/mean_map.png`, `figures/std_map.png` — from the baseline
+* `data/grid_pred.csv` — dense grid predictions (baseline)
 
 ## Notes
 
-- We align coordinates to the **flow vector** (vx, vy). RBF kernel with ARD length-scales then
-  expresses different correlation ranges **along** vs **across** the flow.
-- You can let the GP optimizer tune length-scales or fix/scan values via CLI.
+* **Flow-aligned frame**: rotate (x, y) → (along, cross) using `(vx, vy)`.
+* **Kernel mix (flow frame)**: `RBF` for hotspots + `RationalQuadratic` for multi-scale background + `Matérn-3/2` for roughness robustness.
+* **Shoreline barrier**: multiply base kernel by
 
+  * `exp(-λ_cross)` if the segment crosses land;
+  * `exp(-η / (d + ε))` as near-shore decay (d = distance to coastline).
+* **Physics-soft objective**: minimize `NLL + λ_phys · RMSE(v·∇Z − κΔZ)` on the grid.
+* **Heteroscedastic noise**: `alpha_i = base + c / (dist_to_coast/scale + 1)` (near-shore noisier).
+* **Conformal intervals**: calibrate a z-quantile on a holdout slice for reliable coverage.
+* **Active sampling**: straddle score + approximate info gain − travel-cost penalty.
 
 ## How to reproduce
 
-### Isotropic baseline
 ```bash
-python scripts/run_isotropic.py --length 12 --alpha 1e-6 --no_opt
+# Generate data
+python scripts/generate_synth.py
+
+# Baseline (report MAE/RMSE/CRPS via fast LOO; writes mean/std maps)
+python scripts/run_baseline.py --fast_loo --use_trend
+
+# Physics-soft full run (kernel mix + Malaysia shoreline + PDE penalty + conformal + active sampling)
+python scripts/run_physics_soft.py --use_trend
+
+# Physics-soft with custom shoreline (no download)
+python scripts/run_physics_soft.py --use_trend --coast_path data/malaysia_barrier.geojson
 ```
 
-### Anisotropic (flow-aligned) baseline
-```bash
-python scripts/run_baseline.py --length_parallel 30 --length_cross 8 --alpha 1e-6 --no_opt
+## File map
+
+```
+src/
+  utils/{geo.py, physics.py, metrics.py}
+  models/{kernels.py, phys_soft.py, conformal.py, active_sampling.py}
+scripts/
+  {generate_synth.py, run_baseline.py, run_physics_soft.py}
+data/      # generated: synth_points.csv, grid_coords.csv, flow_meta.json, malaysia_barrier.geojson
+figures/   # outputs: *.png, metrics_physics_soft.json, next_points.csv
+requirements.txt
+README.md
 ```
 
-### Physics soft-constraint (residual-penalty search)
-```bash
-python scripts/run_physics_soft.py --length_parallel_list 20 30 40 --length_cross_list 6 8 12 --lambda_phys 1.0 --kappa 1.0
-```
+Tips
 
-### Parameter sweep (RMSE heatmap data)
-```bash
-python scripts/sweep_lengths.py --lp_list 20 30 40 --lc_list 6 8 12
-```
+* On Windows PowerShell, run commands one-by-one (no `&&`).
+* If `shapely` install fails, upgrade build tools first: `pip install --upgrade pip setuptools wheel`.
 
-### Four-panel comparison
-```bash
-python scripts/make_fourpanel.py
 ```
-Artifacts are saved in `figures/`.
