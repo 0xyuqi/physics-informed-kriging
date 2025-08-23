@@ -1,4 +1,6 @@
-# RMSE/CRPS and directional variogram.
+"""
+Basic metrics and directional variogram.
+"""
 from __future__ import annotations
 import numpy as np
 from scipy.stats import norm
