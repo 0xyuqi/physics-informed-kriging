@@ -3,106 +3,66 @@ name: reproduce-and-artifacts
 on:
   workflow_dispatch:
     inputs:
-      n_obs:  { description: "num obs",  default: "40" }
-      grid:   { description: "grid size", default: "80" }
-      noise:  { description: "noise",     default: "0.1" }
-      vx:     { description: "flow vx",   default: "1.0" }
-      vy:     { description: "flow vy",   default: "0.3" }
-      seed:   { description: "seed",      default: "7" }
-      commit_outputs:
-        description: "push results to branch 'artifacts'"
-        type: boolean
-        default: true
+      num_obs:
+        description: "number of observations"
+        required: true
+        default: "40"
+      grid:
+        description: "grid size"
+        required: true
+        default: "80"
+      noise:
+        description: "observation noise"
+        required: true
+        default: "0.1"
+      vx:
+        description: "flow vx"
+        required: true
+        default: "1.0"
+      vy:
+        description: "flow vy"
+        required: true
+        default: "0.3"
+      seed:
+        description: "random seed"
+        required: true
+        default: "7"
+      commit_artifacts:
+        description: "commit artifacts back to repo"
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
 
 jobs:
   run:
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    env:
-      MPLBACKEND: Agg
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+      - uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install deps (pin shapely for wheels)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install "shapely>=2,<2.1"
 
-      - name: Clean outputs
+      - name: Run pipeline
         run: |
-          if (Test-Path figures) { Remove-Item figures\* -Recurse -Force }
-          Remove-Item data\synth_points.csv,data\grid_coords.csv,data\grid_pred.csv,data\flow_meta.json -Force -ErrorAction SilentlyContinue
-          # 若想强制重建海岸线，再取消下一行注释
-          # Remove-Item data\malaysia_barrier.geojson -Force -ErrorAction SilentlyContinue
+          python scripts/generate_synth.py --n_obs ${{ github.event.inputs.num_obs }} --grid ${{ github.event.inputs.grid }} --noise ${{ github.event.inputs.noise }} --vx ${{ github.event.inputs.vx }} --vy ${{ github.event.inputs.vy }} --seed ${{ github.event.inputs.seed }}
+          python scripts/run_baseline.py
 
-      - name: Generate data
+      - name: Commit artifacts back to repo
+        if: ${{ github.event.inputs.commit_artifacts == 'true' }}
         run: |
-          python scripts\generate_synth.py `
-            --n_obs  ${{ inputs.n_obs }} `
-            --grid   ${{ inputs.grid }} `
-            --noise  ${{ inputs.noise }} `
-            --vx     ${{ inputs.vx }} `
-            --vy     ${{ inputs.vy }} `
-            --seed   ${{ inputs.seed }}
-
-      - name: Baseline
-        run: python scripts\run_baseline.py --fast_loo --use_trend
-
-      - name: Physics-soft
-        run: python scripts\run_physics_soft.py --use_trend
-
-      - name: Upload artifact (zip)
-        uses: actions/upload-artifact@v4
-        with:
-          name: pik_outputs-${{ github.run_number }}
-          if-no-files-found: warn
-          path: |
-            figures/*.png
-            figures/metrics_physics_soft.json
-            figures/next_points.csv
-            data/grid_pred.csv
-            data/malaysia_barrier.geojson
-
-      - name: Commit to 'artifacts' branch
-        if: ${{ inputs.commit_outputs }}
-        shell: bash
-        run: |
-          set -e
-          ts=$(date +'%Y%m%d-%H%M%S')
-          workdir="artifacts/${ts}"
-          mkdir -p "${workdir}/figures" "${workdir}/data"
-          cp -r figures/*.png "${workdir}/figures/" 2>/dev/null || true
-          cp -f figures/metrics_physics_soft.json "${workdir}/figures/" 2>/dev/null || true
-          cp -f figures/next_points.csv "${workdir}/figures/" 2>/dev/null || true
-          cp -f data/grid_pred.csv "${workdir}/data/" 2>/dev/null || true
-          [ -f data/malaysia_barrier.geojson ] && cp -f data/malaysia_barrier.geojson "${workdir}/data/"
-
-          # 切到 artifacts 分支（不存在则创建）
-          git fetch origin
-          if git show-ref --verify --quiet refs/heads/artifacts; then
-            git checkout artifacts
-            git pull --ff-only origin artifacts || true
-          else
-            git checkout --orphan artifacts
-            git reset --hard
-          fi
-
-          mkdir -p "${workdir%/*}"
-          cp -r "${GITHUB_WORKSPACE}/${workdir}" "${workdir}" -r
-
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${workdir}"
-          git commit -m "artifacts: physics-soft run ${ts}"
-          git push origin HEAD:artifacts
+          git add data/*.csv figures/*.png
+          git commit -m "chore: add artifacts from workflow run"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
