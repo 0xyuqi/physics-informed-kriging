@@ -10,25 +10,14 @@ on:
       vy:      { description: "flow vy",                default: "0.3" }
       seed:    { description: "random seed",            default: "7" }
       push_to_artifacts_branch:
-        description: "push summary to 'artifacts' branch"
+        description: "push results to artifacts branch"
         default: "false"
 
 permissions:
   contents: write
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: "pip"
-      - run: pip install -r requirements.txt
-
   sweep-baseline:
-    needs: setup
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -36,56 +25,43 @@ jobs:
         lp: [20, 30, 40]
         lc: [6, 8, 12]
     name: baseline-lp${{ matrix.lp }}-lc${{ matrix.lc }}
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
-      - name: Generate data
+
+      - run: pip install -r requirements.txt
+
+      - name: Generate synthetic data
         run: |
           python scripts/generate_synth.py \
-            --n_obs ${{ inputs.n_obs }} --grid ${{ inputs.grid }} \
-            --noise ${{ inputs.noise }} --vx ${{ inputs.vx }} --vy ${{ inputs.vy }} \
-            --seed ${{ inputs.seed }}
-      - name: Run baseline
+            --n_obs ${{ github.event.inputs.n_obs }} \
+            --grid ${{ github.event.inputs.grid }} \
+            --noise ${{ github.event.inputs.noise }} \
+            --vx ${{ github.event.inputs.vx }} \
+            --vy ${{ github.event.inputs.vy }} \
+            --seed ${{ github.event.inputs.seed }}
+
+      - name: Run baseline GP
         run: |
           retry() { for i in 1 2 3; do "$@" && return 0 || sleep 5; done; return 1; }
           retry python scripts/run_baseline.py \
             --length_parallel ${{ matrix.lp }} \
             --length_cross ${{ matrix.lc }} \
             --alpha 1e-6 --fast_loo
+
       - uses: actions/upload-artifact@v4
         with:
           name: baseline-lp${{ matrix.lp }}-lc${{ matrix.lc }}
           path: |
-            figures/mean_map.png
-            figures/std_map.png
             data/metrics.json
-
-  physics-soft:
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: "pip"
-      - run: pip install -r requirements.txt
-      - name: Run physics soft GP
-        run: |
-          python scripts/run_physics_soft.py \
-            --length_parallel_list 20 30 40 \
-            --length_cross_list 6 8 12 \
-            --lambda_phys 1.0 --kappa 1.0
-      - uses: actions/upload-artifact@v4
-        with:
-          name: physics-soft
-          path: figures/
+            figures/*.png
 
   aggregate:
-    needs: [sweep-baseline, physics-soft]
+    needs: sweep-baseline
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,16 +73,20 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
       - name: Merge results & make heatmap
         run: |
           mkdir -p summary
-          python scripts/sweep_lengths.py --lp_list 20 30 40 --lc_list 6 8 12
+          python scripts/sweep_lengths.py \
+            --lp_list 20 30 40 --lc_list 6 8 12
+
       - uses: actions/upload-artifact@v4
         with:
           name: sweep-summary
           path: summary/
+
       - name: Push to artifacts branch
-        if: ${{ inputs.push_to_artifacts_branch == 'true' }}
+        if: ${{ github.event.inputs.push_to_artifacts_branch == 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
