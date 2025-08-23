@@ -1,0 +1,83 @@
+name: reproduce-and-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      n_obs:          { description: "num obs", default: "40" }
+      grid:           { description: "grid size", default: "80" }
+      noise:          { description: "noise", default: "0.1" }
+      vx:             { description: "flow vx", default: "1.0" }
+      vy:             { description: "flow vy", default: "0.3" }
+      seed:           { description: "seed", default: "7" }
+      commit_outputs: { description: "commit artifacts back to repo", default: "false" }
+  push:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - ".github/workflows/reproduce.yml"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Clean outputs
+        run: |
+          rm -rf figures/* || true
+          rm -f data/synth_points.csv data/grid_coords.csv data/grid_pred.csv data/flow_meta.json || true
+          # 如需强制重建海岸线，取消下一行注释
+          # rm -f data/malaysia_barrier.geojson || true
+
+      - name: Generate data
+        run: |
+          python scripts/generate_synth.py \
+            --n_obs ${{ inputs.n_obs || 40 }} \
+            --grid  ${{ inputs.grid  || 80 }} \
+            --noise ${{ inputs.noise || 0.1 }} \
+            --vx    ${{ inputs.vx    || 1.0 }} \
+            --vy    ${{ inputs.vy    || 0.3 }} \
+            --seed  ${{ inputs.seed  || 7 }}
+
+      - name: Baseline
+        run: python scripts/run_baseline.py --fast_loo --use_trend
+
+      - name: Physics-soft
+        run: python scripts/run_physics_soft.py --use_trend
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pik_outputs-${{ github.run_number }}
+          path: |
+            figures/*.png
+            figures/metrics_physics_soft.json
+            figures/next_points.csv
+            data/grid_pred.csv
+            data/malaysia_barrier.geojson
+
+      - name: Commit outputs to repo (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_outputs == 'true' }}
+        run: |
+          ts=$(date +'%Y%m%d-%H%M%S')
+          mkdir -p artifacts/$ts/figures artifacts/$ts/data
+          cp -r figures/*.png artifacts/$ts/figures/ || true
+          cp -f figures/metrics_physics_soft.json figures/next_points.csv artifacts/$ts/figures/ || true
+          cp -f data/grid_pred.csv artifacts/$ts/data/ || true
+          if [ -f data/malaysia_barrier.geojson ]; then cp -f data/malaysia_barrier.geojson artifacts/$ts/data/; fi
+          git config user.name  "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add artifacts/$ts
+          git commit -m "artifacts: physics-soft run $ts (auto)"
+          git push
