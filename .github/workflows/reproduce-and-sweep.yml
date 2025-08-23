@@ -2,31 +2,18 @@ name: reproduce-and-sweep
 
 on:
   workflow_dispatch:
-    inputs:
-      n_obs:   { description: "number of observations", default: "40" }
-      grid:    { description: "grid size",              default: "80" }
-      noise:   { description: "observation noise",      default: "0.1" }
-      vx:      { description: "flow velocity x",        default: "1.0" }
-      vy:      { description: "flow velocity y",        default: "0.3" }
-      seed:    { description: "random seed",            default: "7" }
-      commit_artifacts:
-        description: "commit artifacts back to repo"
-        default: "false"
 
 jobs:
   setup-matrix:
     runs-on: ubuntu-latest
+    outputs:
+      lp_list: ${{ steps.set.outputs.lp_list }}
+      lc_list: ${{ steps.set.outputs.lc_list }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Cache pip
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - id: set
+        run: |
+          echo "lp_list=[20,30,40]" >> $GITHUB_OUTPUT
+          echo "lc_list=[6,8,12]" >> $GITHUB_OUTPUT
 
   sweep-baseline:
     needs: setup-matrix
@@ -34,66 +21,102 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lp: [20, 30, 40]
-        lc: [6, 8, 12]
+        lp: [20,30,40]
+        lc: [6,8,12]
+    name: sweep-baseline-lp${{ matrix.lp }}-lc${{ matrix.lc }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Run sweep baseline
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run baseline GP
         run: |
           for i in 1 2 3; do
             echo "::group::Attempt $i"
             if python scripts/run_baseline.py \
               --length_parallel ${{ matrix.lp }} \
               --length_cross ${{ matrix.lc }} \
-              --alpha 1e-6 --no_opt; then
+              --alpha 1e-6 --fast_loo; then
               echo "::endgroup::"
-              break
-            else
-              echo "::warning:: Attempt $i failed, retrying..."
-              echo "::endgroup::"
-              sleep 5
+              exit 0
             fi
+            echo "::warning:: attempt $i failed, retrying..."
+            sleep 5
           done
+          exit 1
+
       - uses: actions/upload-artifact@v3
         with:
-          name: baseline-${{ matrix.lp }}-${{ matrix.lc }}
-          path: figures/
+          name: baseline-lp${{ matrix.lp }}-lc${{ matrix.lc }}
+          path: |
+            figures/mean_map.png
+            figures/std_map.png
+            data/metrics.json
+          if-no-files-found: warn
 
   physics-soft:
-    needs: setup-matrix
     runs-on: ubuntu-latest
+    needs: setup-matrix
     steps:
-      - uses: actions/checkout@v4
-      - name: Run physics soft constraint
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+
+      - name: Run physics-informed GP
         run: |
           python scripts/run_physics_soft.py \
             --length_parallel_list 20 30 40 \
             --length_cross_list 6 8 12 \
             --lambda_phys 1.0 --kappa 1.0
+
       - uses: actions/upload-artifact@v3
         with:
           name: physics-soft
-          path: figures/
+          path: figures/phys_soft*.png
 
   aggregate:
-    needs: [sweep-baseline, physics-soft]
     runs-on: ubuntu-latest
+    needs: [sweep-baseline, physics-soft]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v3
-      - name: Merge metrics + generate heatmap
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: pip install pandas matplotlib seaborn
+
+      - name: Merge metrics + heatmap
         run: |
-          python scripts/make_fourpanel.py
+          mkdir -p agg
+          echo "Merging all metrics.json..."
+          python - <<'PY'
+          import json, pathlib, pandas as pd, matplotlib.pyplot as plt, seaborn as sns
+          rows=[]
+          for f in pathlib.Path("data").rglob("metrics.json"):
+              lp,lc=f.parts[-2].split("-lp")[1].split("-lc")
+              d=json.loads(open(f).read())
+              d.update({"lp":int(lp),"lc":int(lc)})
+              rows.append(d)
+          df=pd.DataFrame(rows)
+          df.to_csv("agg/all_metrics.csv",index=False)
+
+          # heatmap
+          pivot=df.pivot("lp","lc","RMSE")
+          plt.figure(figsize=(6,4))
+          sns.heatmap(pivot,annot=True,fmt=".3f",cmap="viridis")
+          plt.title("RMSE heatmap across length scales")
+          plt.savefig("agg/heatmap.png",dpi=150)
+          PY
+
       - uses: actions/upload-artifact@v3
         with:
-          name: all-results
-          path: figures/
-
-      - name: Commit artifacts back
-        if: ${{ github.event.inputs.commit_artifacts == 'true' }}
-        run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add figures/ data/
-          git commit -m "add artifacts [ci skip]" || echo "No changes"
-          git push
+          name: aggregate-results
+          path: agg/
