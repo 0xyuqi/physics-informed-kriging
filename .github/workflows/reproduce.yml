@@ -3,92 +3,64 @@ name: reproduce-and-artifacts
 on:
   workflow_dispatch:
     inputs:
-      n_obs:
-        description: "num obs"
-        required: false
-        default: "40"
-      grid:
-        description: "grid size"
-        required: false
-        default: "80"
-      noise:
-        description: "noise"
-        required: false
-        default: "0.1"
-      vx:
-        description: "flow vx"
-        required: false
-        default: "1.0"
-      vy:
-        description: "flow vy"
-        required: false
-        default: "0.3"
-      seed:
-        description: "seed"
-        required: false
-        default: "7"
+      n_obs:  { description: "num obs",  default: "40" }
+      grid:   { description: "grid size", default: "80" }
+      noise:  { description: "noise",     default: "0.1" }
+      vx:     { description: "flow vx",   default: "1.0" }
+      vy:     { description: "flow vy",   default: "0.3" }
+      seed:   { description: "seed",      default: "7" }
       commit_outputs:
-        description: "commit artifacts back to repo"
+        description: "push results to branch 'artifacts'"
         type: boolean
-        required: false
-        default: false
-  push:
-    branches: [ main ]
-    paths:
-      - "src/**"
-      - "scripts/**"
-      - "requirements.txt"
-      - ".github/workflows/reproduce.yml"
+        default: true
 
 jobs:
   run:
-    runs-on: ubuntu-latest
-
-    # 允许写仓库内容（回写 artifacts）
+    runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      MPLBACKEND: Agg
 
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0            # 允许 push 回 main
-          persist-credentials: true # 复用 GITHUB_TOKEN
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install deps (pin shapely for wheels)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "shapely>=2,<2.1"
 
       - name: Clean outputs
         run: |
-          rm -rf figures/* || true
-          rm -f data/synth_points.csv data/grid_coords.csv data/grid_pred.csv data/flow_meta.json || true
-          # 如需强制重新生成海岸线，取消下一行注释
-          # rm -f data/malaysia_barrier.geojson || true
+          if (Test-Path figures) { Remove-Item figures\* -Recurse -Force }
+          Remove-Item data\synth_points.csv,data\grid_coords.csv,data\grid_pred.csv,data\flow_meta.json -Force -ErrorAction SilentlyContinue
+          # 若想强制重建海岸线，再取消下一行注释
+          # Remove-Item data\malaysia_barrier.geojson -Force -ErrorAction SilentlyContinue
 
       - name: Generate data
-        shell: bash
         run: |
-          python scripts/generate_synth.py \
-            --n_obs "${{ inputs.n_obs || '40' }}" \
-            --grid  "${{ inputs.grid  || '80' }}" \
-            --noise "${{ inputs.noise || '0.1' }}" \
-            --vx    "${{ inputs.vx    || '1.0' }}" \
-            --vy    "${{ inputs.vy    || '0.3' }}" \
-            --seed  "${{ inputs.seed  || '7' }}"
+          python scripts\generate_synth.py `
+            --n_obs  ${{ inputs.n_obs }} `
+            --grid   ${{ inputs.grid }} `
+            --noise  ${{ inputs.noise }} `
+            --vx     ${{ inputs.vx }} `
+            --vy     ${{ inputs.vy }} `
+            --seed   ${{ inputs.seed }}
 
-      - name: Run baseline
-        run: python scripts/run_baseline.py --fast_loo --use_trend
+      - name: Baseline
+        run: python scripts\run_baseline.py --fast_loo --use_trend
 
-      - name: Run physics-soft
-        run: python scripts/run_physics_soft.py --use_trend
+      - name: Physics-soft
+        run: python scripts\run_physics_soft.py --use_trend
 
       - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
@@ -102,19 +74,35 @@ jobs:
             data/grid_pred.csv
             data/malaysia_barrier.geojson
 
-      - name: Commit artifacts back to repo
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_outputs }}
+      - name: Commit to 'artifacts' branch
+        if: ${{ inputs.commit_outputs }}
         shell: bash
         run: |
+          set -e
           ts=$(date +'%Y%m%d-%H%M%S')
-          mkdir -p artifacts/$ts/figures artifacts/$ts/data
-          cp -r figures/*.png artifacts/$ts/figures/ || true
-          cp -f figures/metrics_physics_soft.json artifacts/$ts/figures/ || true
-          cp -f figures/next_points.csv artifacts/$ts/figures/ || true
-          cp -f data/grid_pred.csv artifacts/$ts/data/ || true
-          if [ -f data/malaysia_barrier.geojson ]; then cp -f data/malaysia_barrier.geojson artifacts/$ts/data/; fi
+          workdir="artifacts/${ts}"
+          mkdir -p "${workdir}/figures" "${workdir}/data"
+          cp -r figures/*.png "${workdir}/figures/" 2>/dev/null || true
+          cp -f figures/metrics_physics_soft.json "${workdir}/figures/" 2>/dev/null || true
+          cp -f figures/next_points.csv "${workdir}/figures/" 2>/dev/null || true
+          cp -f data/grid_pred.csv "${workdir}/data/" 2>/dev/null || true
+          [ -f data/malaysia_barrier.geojson ] && cp -f data/malaysia_barrier.geojson "${workdir}/data/"
+
+          # 切到 artifacts 分支（不存在则创建）
+          git fetch origin
+          if git show-ref --verify --quiet refs/heads/artifacts; then
+            git checkout artifacts
+            git pull --ff-only origin artifacts || true
+          else
+            git checkout --orphan artifacts
+            git reset --hard
+          fi
+
+          mkdir -p "${workdir%/*}"
+          cp -r "${GITHUB_WORKSPACE}/${workdir}" "${workdir}" -r
+
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add artifacts/$ts
-          git commit -m "artifacts: physics-soft run $ts (auto)"
-          git push
+          git add "${workdir}"
+          git commit -m "artifacts: physics-soft run ${ts}"
+          git push origin HEAD:artifacts
