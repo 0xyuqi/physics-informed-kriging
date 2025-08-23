@@ -81,3 +81,5 @@ jobs:
           git add artifacts/$ts
           git commit -m "artifacts: physics-soft run $ts (auto)"
           git push
+permissions:
+  contents: write
