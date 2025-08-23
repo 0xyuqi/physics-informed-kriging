@@ -3,45 +3,19 @@ name: reproduce-and-sweep
 on:
   workflow_dispatch:
     inputs:
-      n_obs:
-        description: "number of observations"
-        default: "40"
-      grid:
-        description: "grid size"
-        default: "80"
-      noise:
-        description: "observation noise"
-        default: "0.1"
-      vx:
-        description: "flow vx"
-        default: "1.0"
-      vy:
-        description: "flow vy"
-        default: "0.3"
-      seed:
-        description: "random seed"
-        default: "7"
-      lp_list:
-        description: "lp list (csv)"
-        default: "20,30,40"
-      lc_list:
-        description: "lc list (csv)"
-        default: "6,8,12"
-      alpha_list:
-        description: "alpha list (csv)"
-        default: "1e-6,1e-5"
-      trend_list:
-        description: "use_trend list (csv: true,false)"
-        default: "true,false"
-      os_list:
-        description: "runner OS list (csv: ubuntu,windows)"
-        default: "ubuntu"
-      max_runs:
-        description: "cap total combos to avoid explosion"
-        default: "24"
-      push_to_artifacts_branch:
-        description: "also push summary to 'artifacts' branch"
-        default: "false"
+      n_obs:   { description: "number of observations", default: "40" }
+      grid:    { description: "grid size",               default: "80" }
+      noise:   { description: "observation noise",       default: "0.1" }
+      vx:      { description: "flow vx",                 default: "1.0" }
+      vy:      { description: "flow vy",                 default: "0.3" }
+      seed:    { description: "random seed",             default: "7" }
+      lp_list: { description: "lp list (csv)",           default: "20,30,40" }
+      lc_list: { description: "lc list (csv)",           default: "6,8,12" }
+      alpha_list: { description: "alpha list (csv)",     default: "1e-6,1e-5" }
+      trend_list: { description: "use_trend list (csv: true,false)", default: "true,false" }
+      os_list: { description: "runner OS list (csv: ubuntu,windows)", default: "ubuntu" }
+      max_runs: { description: "cap total combos", default: "24" }
+      push_to_artifacts_branch: { description: "push summary to 'artifacts' branch", default: "false" }
 
 permissions:
   contents: write
@@ -96,49 +70,33 @@ jobs:
       MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
 
       - name: Install deps (pin wheels where needed)
-        shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install "shapely>=2,<2.1" || true
 
-      - name: Helper retry()
-        shell: bash
+      - name: Generate data (with retry)
         run: |
-          cat > retry.sh <<'BASH'
-#!/usr/bin/env bash
-set -e
-cmd="$*"
-for i in 1 2 3; do
-  echo "::group::Attempt $i: $cmd"
-  if eval "$cmd"; then echo "::endgroup::"; exit 0; fi
-  echo "::warning::Attempt $i failed, retrying..."
-  sleep 3
-  echo "::endgroup::"
-done
-echo "::error::All retries failed"; exit 1
-BASH
-          chmod +x retry.sh
-
-      - name: Clean outputs
-        shell: bash
-        run: |
-          rm -rf figures/* || true
-          rm -f data/synth_points.csv data/grid_coords.csv data/grid_pred.csv data/flow_meta.json || true
-
-      - name: Generate data
-        shell: bash
-        run: |
-          ./retry.sh python scripts/generate_synth.py \
+          set -euxo pipefail
+          retry() {
+            local cmd="$*"
+            for i in 1 2 3; do
+              echo "::group::Attempt $i: $cmd"
+              if eval "$cmd"; then echo "::endgroup::"; return 0; fi
+              echo "::warning::Attempt $i failed, retrying..."; sleep 3; echo "::endgroup::"
+            done
+            echo "::error::All retries failed"; return 1
+          }
+          retry python scripts/generate_synth.py \
             --n_obs "${{ inputs.n_obs }}" \
             --grid  "${{ inputs.grid  }}" \
             --noise "${{ inputs.noise }}" \
@@ -148,11 +106,20 @@ BASH
           ls -l data || true
 
       - name: Run baseline (lp=${{ matrix.lp }}, lc=${{ matrix.lc }}, alpha=${{ matrix.alpha }}, trend=${{ matrix.use_trend }})
-        shell: bash
         run: |
+          set -euxo pipefail
+          retry() {
+            local cmd="$*"
+            for i in 1 2 3; do
+              echo "::group::Attempt $i: $cmd"
+              if eval "$cmd"; then echo "::endgroup::"; return 0; fi
+              echo "::warning::Attempt $i failed, retrying..."; sleep 3; echo "::endgroup::"
+            done
+            echo "::error::All retries failed"; return 1
+          }
           TREND_FLAG=""
           if ${{ matrix.use_trend }}; then TREND_FLAG="--use_trend"; fi
-          ./retry.sh python scripts/run_baseline.py \
+          retry python scripts/run_baseline.py \
             --fast_loo ${TREND_FLAG} \
             --length_parallel ${{ matrix.lp }} \
             --length_cross    ${{ matrix.lc }} \
@@ -180,21 +147,20 @@ BASH
       MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
       - name: Install deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install "shapely>=2,<2.1" || true
-      - name: Clean outputs
-        run: rm -rf figures/* || true
-      - name: Generate data (same seed)
+      - name: Generate data
         run: |
+          set -euxo pipefail
           python scripts/generate_synth.py \
             --n_obs "${{ inputs.n_obs }}" \
             --grid  "${{ inputs.grid  }}" \
@@ -204,6 +170,7 @@ BASH
             --seed  "${{ inputs.seed  }}"
       - name: Run physics-soft (MY shoreline + kernel mix + conformal + active sampling)
         run: |
+          set -euxo pipefail
           python scripts/run_physics_soft.py --use_trend
           mkdir -p sweep/phys
           cp -f figures/metrics_physics_soft.json sweep/phys/
@@ -226,8 +193,7 @@ BASH
       MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -248,54 +214,49 @@ BASH
           name: physics-soft
           path: _dl/phys
       - name: Merge metrics + plot heatmaps
-        shell: bash
+        shell: python
         run: |
-          python - <<'PY'
-import json, re, os, glob
-import numpy as np, pandas as pd, matplotlib.pyplot as plt
-os.makedirs("summary", exist_ok=True)
+          import json, re, os, glob
+          import numpy as np, pandas as pd, matplotlib.pyplot as plt
+          os.makedirs("summary", exist_ok=True)
+          rows=[]
+          for p in glob.glob("_dl/baseline/metrics_lp*_lc*_a*_*.json"):
+              bn=os.path.basename(p)
+              m=re.search(r"metrics_lp(\d+)_lc(\d+)_a([^_]+)_(tr[01])_os-(.+)\.json$", bn)
+              if not m: 
+                  continue
+              lp,lc,a,tr,osname=m.groups()
+              with open(p,"r",encoding="utf-8") as f: js=json.load(f)
+              rows.append({"lp":int(lp),"lc":int(lc),"alpha":a,"trend":1 if tr=='tr1' else 0,"os":osname,
+                           "MAE":js.get("MAE"),"RMSE":js.get("RMSE"),"CRPS":js.get("CRPS")})
+          df=pd.DataFrame(rows)
+          if df.empty: raise SystemExit("no baseline metrics found")
+          df.to_csv("summary/baseline_metrics_full.csv", index=False)
 
-rows=[]
-for p in glob.glob("_dl/baseline/metrics_lp*_lc*_a*_*.json"):
-    bn=os.path.basename(p)
-    m=re.search(r"metrics_lp(\d+)_lc(\d+)_a([^_]+)_(tr[01])_os-(.+)\.json$", bn)
-    if not m: 
-        continue
-    lp,lc,a,tr,osname=m.groups()
-    with open(p,"r",encoding="utf-8") as f: js=json.load(f)
-    rows.append({"lp":int(lp),"lc":int(lc),"alpha":a,"trend":1 if tr=='tr1' else 0,"os":osname,
-                 "MAE":js.get("MAE"),"RMSE":js.get("RMSE"),"CRPS":js.get("CRPS")})
-df=pd.DataFrame(rows)
-if df.empty: raise SystemExit("no baseline metrics found")
-df.to_csv("summary/baseline_metrics_full.csv", index=False)
+          sel=df.sort_values(["alpha","trend","os"]).iloc[0]
+          dfh=df[(df["alpha"]==sel["alpha"])&(df["trend"]==sel["trend"])&(df["os"]==sel["os"])]
+          def heat(dfv,val,fname):
+              piv=dfv.pivot(index="lc",columns="lp",values=val)
+              fig=plt.figure()
+              im=plt.imshow(piv.values,origin="lower",aspect="auto")
+              plt.xticks(range(len(piv.columns)),piv.columns)
+              plt.yticks(range(len(piv.index)),piv.index)
+              plt.xlabel("length_parallel (lp)")
+              plt.ylabel("length_cross (lc)")
+              plt.title(f"{val} heatmap (alpha={sel['alpha']}, trend={int(sel['trend'])}, os={sel['os']})")
+              plt.colorbar(im)
+              for i,lc in enumerate(piv.index):
+                  for j,lp in enumerate(piv.columns):
+                      v=piv.loc[lc,lp]
+                      if pd.notnull(v): plt.text(j,i,f"{v:.3f}",ha="center",va="center",fontsize=8)
+              plt.tight_layout(); plt.savefig(f"summary/{fname}",dpi=160); plt.close(fig)
+          for k in ["RMSE","MAE","CRPS"]:
+              heat(dfh,k,f"baseline_{k.lower()}_heatmap.png")
 
-sel=df.sort_values(["alpha","trend","os"]).iloc[0]
-dfh=df[(df["alpha"]==sel["alpha"])&(df["trend"]==sel["trend"])&(df["os"]==sel["os"])]
+          for q in ["metrics_physics_soft.json","mean_physics_soft.png","std_map.png","physics_residual.png","variogram.png","next_points.csv","grid_pred.csv","malaysia_barrier.geojson"]:
+              for s in glob.glob(os.path.join("_dl/phys", q)):
+                  os.system(f'cp "{s}" "summary/{os.path.basename(s)}"')
 
-def heat(dfv,val,fname):
-    piv=dfv.pivot(index="lc",columns="lp",values=val)
-    fig=plt.figure()
-    im=plt.imshow(piv.values,origin="lower",aspect="auto")
-    plt.xticks(range(len(piv.columns)),piv.columns)
-    plt.yticks(range(len(piv.index)),piv.index)
-    plt.xlabel("length_parallel (lp)")
-    plt.ylabel("length_cross (lc)")
-    plt.title(f"{val} heatmap (alpha={sel['alpha']}, trend={int(sel['trend'])}, os={sel['os']})")
-    plt.colorbar(im)
-    for i,lc in enumerate(piv.index):
-        for j,lp in enumerate(piv.columns):
-            v=piv.loc[lc,lp]
-            if pd.notnull(v): plt.text(j,i,f"{v:.3f}",ha="center",va="center",fontsize=8)
-    plt.tight_layout(); plt.savefig(f"summary/{fname}",dpi=160); plt.close(fig)
-
-for k in ["RMSE","MAE","CRPS"]:
-    heat(dfh,k,f"baseline_{k.lower()}_heatmap.png")
-
-for q in ["metrics_physics_soft.json","mean_physics_soft.png","std_map.png","physics_residual.png","variogram.png","next_points.csv","grid_pred.csv","malaysia_barrier.geojson"]:
-    for s in glob.glob(os.path.join("_dl/phys", q)):
-        os.system(f'cp "{s}" "summary/{os.path.basename(s)}"')
-print("[OK] summary ready")
-PY
       - name: Upload sweep summary
         uses: actions/upload-artifact@v4
         with:
@@ -303,9 +264,9 @@ PY
           if-no-files-found: error
           retention-days: 14
           path: summary/
+
       - name: Push summary to 'artifacts' branch (optional)
         if: ${{ inputs.push_to_artifacts_branch == 'true' }}
-        shell: bash
         run: |
           set -e
           ts=$(date +'%Y%m%d-%H%M%S')
